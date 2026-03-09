@@ -19,6 +19,7 @@ Route::post('register', [\App\Http\Controllers\AuthController::class, 'register'
 Route::post('login', [\App\Http\Controllers\AuthController::class, 'login']);
 Route::post('forgot-password', [\App\Http\Controllers\AuthController::class, 'forgotPassword']);
 Route::post('reset-password', [\App\Http\Controllers\AuthController::class, 'resetPassword']);
+Route::post('verify-pin', [\App\Http\Controllers\AuthController::class, 'verifyPin']);
 
 // protected routes
 Route::middleware('auth:sanctum')->group(function () {

@@ -6,6 +6,8 @@ use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Password;
+use Illuminate\Support\Facades\Notification;
+use App\Notifications\ResetPinNotification;
 use Laravel\Sanctum\Sanctum;
 use Tests\TestCase;
 
@@ -96,28 +98,56 @@ class AuthTest extends TestCase
     {
         $user = User::factory()->create();
 
+        Notification::fake();
+
         $response = $this->postJson('/api/forgot-password', [
             'email' => $user->email,
         ]);
 
-        $response->assertOk()->assertJsonStructure(['message', 'token']);
+        $response->assertOk()->assertJsonStructure(['message']);
 
-        // ensure token is actually returned and can be used for a reset (optional)
-        $data = $response->json();
-        $this->assertIsString($data['token']);
+        Notification::assertSentTo(
+            $user,
+            ResetPinNotification::class,
+            function ($notification, $channels) {
+                return is_string($notification->pin) && strlen($notification->pin) === 6;
+            }
+        );
     }
 
     public function test_reset_password_using_token()
     {
         $user = User::factory()->create();
 
-        $token = Password::broker()->createToken($user);
+        Notification::fake();
+
+        // request a PIN using the forgot endpoint and capture it from notification
+        $this->postJson('/api/forgot-password', [
+            'email' => $user->email,
+        ])->assertOk();
+
+        $capturedPin = null;
+        Notification::assertSentTo($user, ResetPinNotification::class, function ($notification) use (&$capturedPin) {
+            $capturedPin = $notification->pin;
+            return true;
+        });
+
+        $pin = $capturedPin;
+
+        // verify the pin to get a reset token
+        $verify = $this->postJson('/api/verify-pin', [
+            'email' => $user->email,
+            'pin' => $pin,
+        ])->assertOk()->json();
+
+        $this->assertArrayHasKey('reset_token', $verify);
+        $resetToken = $verify['reset_token'];
 
         $new = 'newpassword123';
 
         $response = $this->postJson('/api/reset-password', [
             'email' => $user->email,
-            'token' => $token,
+            'reset_token' => $resetToken,
             'password' => $new,
             'password_confirmation' => $new,
         ]);

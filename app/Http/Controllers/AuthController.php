@@ -9,6 +9,10 @@ use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Password;
 use Illuminate\Support\Str;
+use Illuminate\Support\Facades\DB;
+use Carbon\Carbon;
+use App\Notifications\ResetPinNotification;
+use Illuminate\Support\Facades\Crypt;
 
 class AuthController extends Controller
 {
@@ -20,7 +24,7 @@ class AuthController extends Controller
         $validated = $request->validate([
             'name' => ['required', 'string', 'max:255'],
             'email' => ['required', 'email', 'max:255', 'unique:users'],
-            'password' => ['required', 'string', 'min:8', 'confirmed'],
+            'password' => ['required', 'string', 'min:8'],
         ]);
 
         $user = User::create([
@@ -103,19 +107,31 @@ class AuthController extends Controller
      */
     public function forgotPassword(Request $request)
     {
-        $request->validate(['email' => ['required', 'email']]);
+        $request->validate(
+            ['email' => ['required', 'email', 'exists:users,email']],
+            ['email.exists' => 'Invalid Email.']
+        );
 
         $user = User::where('email', $request->email)->first();
-        if (! $user) {
-            // don't reveal the existence of the email address
-            return response()->json(['message' => 'If your email exists we have sent a reset token']);
-        }
 
-        $token = Password::broker()->createToken($user);
+        // generate a numeric 6-digit PIN
+        $pin = str_pad(random_int(0, 999999), 6, '0', STR_PAD_LEFT);
 
+        // store a hashed version in the password_reset_tokens table
+        DB::table(config('auth.passwords.users.table', 'password_reset_tokens'))
+            ->updateOrInsert(
+                ['email' => $user->email],
+                [
+                    'token' => hash('sha256', $pin),
+                    'created_at' => Carbon::now(),
+                ]
+            );
+
+        // send the PIN via email
+        $result = $user->notify(new ResetPinNotification($pin));
+        // dd($result);
         return response()->json([
-            'message' => 'Reset token generated',
-            'token' => $token,
+            'message' => 'If your email exists we have sent a reset PIN',
         ]);
     }
 
@@ -126,23 +142,94 @@ class AuthController extends Controller
     {
         $request->validate([
             'email' => ['required', 'email'],
-            'token' => ['required'],
-            'password' => ['required', 'string', 'min:8', 'confirmed'],
+            'reset_token' => ['required'],
+            'password' => ['required', 'string', 'min:8'],
         ]);
 
-        $status = Password::reset(
-            $request->only('email', 'password', 'password_confirmation', 'token'),
-            function (User $user, $password) {
-                $user->password = Hash::make($password);
-                $user->setRememberToken(Str::random(60));
-                $user->save();
+        // validate the reset token produced by verifyPin
+        try {
+            $payload = json_decode(Crypt::decryptString($request->reset_token), true);
+        } catch (\Exception $e) {
+            return response()->json(['message' => 'Invalid or expired reset token'], 422);
+        }
 
-                event(new PasswordReset($user));
-            }
-        );
+        if (! isset($payload['email']) || $payload['email'] !== $request->email) {
+            return response()->json(['message' => 'Invalid reset token for this email'], 422);
+        }
 
-        return $status === Password::PASSWORD_RESET
-                    ? response()->json(['message' => __($status)])
-                    : response()->json(['message' => __($status)], 422);
+        if (! isset($payload['expires_at']) || Carbon::now()->gt(Carbon::parse($payload['expires_at']))) {
+            return response()->json(['message' => 'Reset token expired'], 422);
+        }
+
+        // perform the reset
+        $user = User::where('email', $request->email)->first();
+        if (! $user) {
+            return response()->json(['message' => 'User not found'], 422);
+        }
+
+        $user->password = Hash::make($request->password);
+        $user->setRememberToken(Str::random(60));
+        $user->save();
+
+        event(new PasswordReset($user));
+
+        // delete the used PIN
+        DB::table(config('auth.passwords.users.table', 'password_reset_tokens'))
+            ->where('email', $request->email)
+            ->delete();
+
+        return response()->json(['message' => 'Password reset successfully']);
+    }
+
+    /**
+     * Verify the 6-digit PIN and return a short-lived reset token.
+     */
+    public function verifyPin(Request $request)
+    {
+        $request->validate([
+            'email' => ['required', 'email'],
+            'pin' => ['required'],
+        ]);
+
+        $row = DB::table(config('auth.passwords.users.table', 'password_reset_tokens'))
+                ->where('email', $request->email)
+                ->first();
+
+        if (! $row) {
+            return response()->json(['message' => 'Invalid PIN'], 422);
+        }
+
+        // check expiry (use configured minutes)
+        $expireMinutes = config('auth.passwords.users.expire', 60);
+        $created = Carbon::parse($row->created_at);
+        if (Carbon::now()->subMinutes($expireMinutes)->gt($created)) {
+            return response()->json(['message' => 'PIN expired'], 422);
+        }
+
+        // verify PIN (stored hashed with sha256)
+        if (! hash_equals($row->token, hash('sha256', $request->pin))) {
+            return response()->json(['message' => 'Invalid PIN'], 422);
+        }
+
+        // generate a short-lived encrypted reset token (e.g., 15 minutes)
+        $resetTtl = min(15, $expireMinutes); // don't exceed pin expiry
+        $payload = [
+            'email' => $request->email,
+            'issued_at' => Carbon::now()->toIso8601String(),
+            'expires_at' => Carbon::now()->addMinutes($resetTtl)->toIso8601String(),
+        ];
+
+        $resetToken = Crypt::encryptString(json_encode($payload));
+
+        // delete the PIN row so it's one-time use
+        DB::table(config('auth.passwords.users.table', 'password_reset_tokens'))
+            ->where('email', $request->email)
+            ->delete();
+
+        return response()->json([
+            'message' => 'PIN verified',
+            'reset_token' => $resetToken,
+            'expires_in_minutes' => $resetTtl,
+        ]);
     }
 }
