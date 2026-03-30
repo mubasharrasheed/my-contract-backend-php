@@ -28,4 +28,9 @@ Route::middleware('auth:sanctum')->group(function () {
     });
 
     Route::get('logout', [\App\Http\Controllers\AuthController::class, 'logout']);
+
+    // Contracts: create (PDF upload) + index/show; documents are linked via contract
+    Route::post('contracts', [\App\Http\Controllers\ContractController::class, 'create']);
+    Route::get('contracts', [\App\Http\Controllers\ContractController::class, 'index']);
+    Route::get('contracts/{contract}', [\App\Http\Controllers\ContractController::class, 'show']);
 });
