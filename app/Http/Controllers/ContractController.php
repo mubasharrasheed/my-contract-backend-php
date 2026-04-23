@@ -35,7 +35,7 @@ class ContractController extends Controller
         $originalName = $uploadedFile->getClientOriginalName();
         $name = pathinfo(rawurldecode($originalName), PATHINFO_FILENAME);
         $path = $uploadedFile->store(
-            'documents/' . $request->user()->id,
+            'documents/'.$request->user()->id,
             'local'
         );
 
@@ -43,7 +43,7 @@ class ContractController extends Controller
             throw ValidationException::withMessages(['file' => ['Failed to store file.']]);
         }
 
-        $fullPath = storage_path('app/' . $path);
+        $fullPath = storage_path('app/'.$path);
         $extension = $this->uploadExtension($uploadedFile);
 
         try {
@@ -51,7 +51,7 @@ class ContractController extends Controller
         } catch (\Exception $e) {
             Storage::disk('local')->delete($path);
             throw ValidationException::withMessages([
-                'file' => ['Could not read document: ' . $e->getMessage()],
+                'file' => ['Could not read document: '.$e->getMessage()],
             ]);
         }
 
@@ -99,7 +99,7 @@ class ContractController extends Controller
             $uploadedFile = $request->file('file');
             $originalName = $uploadedFile->getClientOriginalName();
             $path = $uploadedFile->store(
-                'documents/' . $request->user()->id,
+                'documents/'.$request->user()->id,
                 'local'
             );
 
@@ -107,7 +107,7 @@ class ContractController extends Controller
                 throw ValidationException::withMessages(['file' => ['Failed to store file.']]);
             }
 
-            $fullPath = storage_path('app/' . $path);
+            $fullPath = storage_path('app/'.$path);
             $extension = $this->uploadExtension($uploadedFile);
 
             try {
@@ -115,11 +115,12 @@ class ContractController extends Controller
             } catch (\Exception $e) {
                 Storage::disk('local')->delete($path);
                 throw ValidationException::withMessages([
-                    'file' => ['Could not read document: ' . $e->getMessage()],
+                    'file' => ['Could not read document: '.$e->getMessage()],
                 ]);
             }
 
-            $contractData = $this->extractionService->extractForContract($rawText ?? '', $contract->name);
+            $nameHint = pathinfo(rawurldecode($originalName), PATHINFO_FILENAME);
+            $contractData = $this->extractionService->extractForContract($rawText ?? '', $nameHint);
             // dd($contractData);
             $contract->update($contractData);
 
@@ -138,6 +139,7 @@ class ContractController extends Controller
                 ]);
             }
         }
+
         return response()->json([
             'message' => 'Contract updated from uploaded document.',
             'contract' => @$contract->fresh(),
