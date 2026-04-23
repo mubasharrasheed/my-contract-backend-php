@@ -14,6 +14,7 @@ class Contract extends Model
     protected $fillable = [
         'user_id',
         'agreement_number',
+        'name',
         'grant_amount',
         'effective_date',
         'expiry_date',

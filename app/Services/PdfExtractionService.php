@@ -29,13 +29,14 @@ class PdfExtractionService
     /**
      * Return flat array suitable for Contract::create() (excluding user_id).
      */
-    public function extractForContract(string $rawText): array
+    public function extractForContract(string $rawText, string $originalName): array
     {
         $data = $this->extractFromRawText($rawText);
         $company = $data['company'] ?? [];
         $recipient = $data['recipient'] ?? [];
 
         return array_filter([
+            'name' => $originalName ?? null,
             'agreement_number' => $data['agreement_number'] ?? null,
             'grant_amount' => $data['grant_amount'] ?? null,
             'effective_date' => $data['effective_date'] ?? null,
