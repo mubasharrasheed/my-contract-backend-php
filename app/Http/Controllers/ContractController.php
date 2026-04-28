@@ -56,7 +56,9 @@ class ContractController extends Controller
         }
 
         $contractData = $this->extractionService->extractForContract($rawText ?? '', $name);
-        $contract = $request->user()->contracts()->create($contractData);
+        $contract = $request->user()->contracts()->create(array_merge($contractData, [
+            'status' => Contract::STATUS_IN_PROGRESS,
+        ]));
 
         $document = $request->user()->documents()->create([
             'contract_id' => $contract->id,
@@ -149,13 +151,41 @@ class ContractController extends Controller
 
     public function index(Request $request): JsonResponse
     {
-        $contracts = $request->user()
-            ->contracts()
-            ->with('documents')
-            ->orderByDesc('created_at')
-            ->get();
+        $request->validate([
+            'status' => ['nullable', 'in:in_progress,completed'],
+            'search' => ['nullable', 'string', 'max:255'],
+            'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
+        ]);
 
-        return response()->json(['contracts' => $contracts]);
+        $mycontracts = $request->user()->contracts()->where('status', Contract::STATUS_IN_PROGRESS)->get();
+
+        foreach ($mycontracts as $contract) {
+            $contract->refreshStatusFromExpiry();
+        }
+
+        $query = $request->user()
+            ->contracts()
+            ->with('documents');
+
+        if ($status = $request->input('status')) {
+            $query->where('status', $status);
+        }
+
+        if ($search = trim((string) $request->input('search'))) {
+            $like = '%'.$search.'%';
+            $query->where(function ($q) use ($like) {
+                $q->where('name', 'like', $like)
+                    ->orWhere('agreement_number', 'like', $like)
+                    ->orWhere('recipient_name', 'like', $like)
+                    ->orWhere('company_name', 'like', $like);
+            });
+        }
+
+        $contracts = $query->orderByDesc('created_at')
+            ->paginate((int) $request->input('per_page', 15))
+            ->withQueryString();
+
+        return response()->json($contracts);
     }
 
     public function show(Request $request, Contract $contract): JsonResponse
@@ -164,7 +194,9 @@ class ContractController extends Controller
             abort(404);
         }
 
-        return response()->json(['contract' => $contract->load('documents')]);
+        $contract->refreshStatusFromExpiry();
+
+        return response()->json(['contract' => $contract->fresh()->load('documents')]);
     }
 
     protected function uploadExtension(UploadedFile $file): string
