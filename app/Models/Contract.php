@@ -2,6 +2,7 @@
 
 namespace App\Models;
 
+use Carbon\Carbon;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
@@ -11,8 +12,13 @@ class Contract extends Model
 {
     use HasFactory;
 
+    public const STATUS_IN_PROGRESS = 'in_progress';
+
+    public const STATUS_COMPLETED = 'completed';
+
     protected $fillable = [
         'user_id',
+        'status',
         'agreement_number',
         'name',
         'grant_amount',
@@ -48,5 +54,24 @@ class Contract extends Model
     public function documents(): HasMany
     {
         return $this->hasMany(Document::class);
+    }
+
+    public function refreshStatusFromExpiry(): void
+    {
+        if ($this->status === self::STATUS_COMPLETED) {
+            return;
+        }
+
+        if (empty($this->expiry_date)) {
+            return;
+        }
+
+        try {
+            if (Carbon::parse($this->expiry_date)->endOfDay()->isPast()) {
+                $this->update(['status' => self::STATUS_COMPLETED]);
+            }
+        } catch (\Throwable) {
+            // unparsable date string — leave status unchanged
+        }
     }
 }
