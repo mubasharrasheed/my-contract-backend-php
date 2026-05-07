@@ -26,24 +26,58 @@ class ContractFileTextExtractor
 
     protected function extractPdf(string $path): string
     {
+        // 1. Always try Smalot first (original behaviour)
         $parser = new Parser;
         $pdf = $parser->parseFile($path);
-        $text = $this->normalizePdfText($pdf->getText() ?? '');
+        $smalotText = $this->normalizePdfText($pdf->getText() ?? '');
 
+        // 2. Try pdftotext if binary is configured
         $binary = env('PDFTOTEXT_BINARY', '');
-        $alt = ($binary !== '' && is_file($binary)) ? $this->tryPdftotext($path) : null;
-        $alt = is_string($alt) && $alt !== '' ? $this->normalizePdfText($alt) : null;
-
-        if ($alt !== null) {
-            $preferAlt = $this->pdfStructureScore($alt) > $this->pdfStructureScore($text) + 1
-                || $this->pdfTextQuality($alt) > $this->pdfTextQuality($text) + 0.08;
-
-            if ($preferAlt) {
-                $text = $alt;
+        $pdftotextText = null;
+        if ($binary !== '' && is_file($binary)) {
+            $pdftotextText = $this->tryPdftotext($path);
+            if (is_string($pdftotextText) && $pdftotextText !== '') {
+                $pdftotextText = $this->normalizePdfText($pdftotextText);
+            } else {
+                $pdftotextText = null;
             }
         }
 
-        return $text;
+        // 3. Decision: if pdftotext is available AND contains address info, use it immediately.
+        if ($pdftotextText !== null && $this->containsAddressInformation($pdftotextText)) {
+            return $pdftotextText;
+        }
+
+        // 4. Otherwise fall back to the original scoring logic
+        if ($pdftotextText !== null) {
+            $preferAlt = $this->pdfStructureScore($pdftotextText) > $this->pdfStructureScore($smalotText) + 1
+                      || $this->pdfTextQuality($pdftotextText) > $this->pdfTextQuality($smalotText) + 0.08;
+            if ($preferAlt) {
+                return $pdftotextText;
+            }
+        }
+
+        return $smalotText;
+    }
+
+    /**
+     * Check if the given text contains typical company/address information.
+     * Used to decide whether pdftotext is doing a better job than Smalot.
+     */
+    protected function containsAddressInformation(string $text): bool
+    {
+        $patterns = [
+            '/\b\d{5}(?:-\d{4})?\b/',                 // ZIP code (5 or 9 digits)
+            '/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/', // email
+            '/\b(?:street|st|avenue|ave|road|rd|drive|dr|lane|ln|boulevard|blvd)\b/i',
+            '/\b(?:inc|llc|ltd|corp|corporation|co\.?)\b/i',
+        ];
+        foreach ($patterns as $pattern) {
+            if (preg_match($pattern, $text)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

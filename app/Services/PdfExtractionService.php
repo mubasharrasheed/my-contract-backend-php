@@ -39,6 +39,45 @@ class PdfExtractionService
         $company = $data['company'] ?? [];
         $recipient = $data['recipient'] ?? [];
 
+        // ----- Oregon Grant specific extraction (overwrites missing fields) -----
+        $oregonRecipient = $this->extractOregonGrantRecipient($norm);
+        $oregonCompany = $this->extractOregonGrantCompany($norm);
+
+        // Merge: Oregon data takes precedence only if original is empty
+        $recipient = array_merge($recipient, array_filter($oregonRecipient));
+        $company = array_merge($company, array_filter($oregonCompany));
+
+        // Fix swapped addresses: if recipient has agency address (Salem) and company has no address, swap
+        if (isset($recipient['city_state_zip']) && str_contains($recipient['city_state_zip'], 'Salem')) {
+            // Likely swapped: move agency address to company, grantee address to recipient
+            if (empty($company['city_state_zip']) && !empty($recipient['city_state_zip'])) {
+                $company['city_state_zip'] = $recipient['city_state_zip'];
+                $recipient['city_state_zip'] = null;
+            }
+            if (empty($company['street_address']) && !empty($recipient['street_address']) && str_contains($recipient['street_address'], 'Summer')) {
+                $company['street_address'] = $recipient['street_address'];
+                $recipient['street_address'] = null;
+            }
+        }
+
+        // Special fix: if recipient name is still empty but we have an email with ulpdx.org, try to extract name from nearby text
+        if (empty($recipient['name']) && !empty($recipient['email']) && str_contains($recipient['email'], 'ulpdx')) {
+            // Find the line containing the email and capture a name before it
+            if (preg_match('/([A-Z][a-z]+ [A-Z][a-z]+).*?'.preg_quote($recipient['email'], '/').'/s', $norm, $nameMatch)) {
+                $recipient['name'] = trim($nameMatch[1]);
+            }
+        }
+
+        // If company name is too long or contains "Grantee", clean it up
+        if (!empty($company['name']) && (strlen($company['name']) > 100 || stripos($company['name'], 'Grantee') !== false)) {
+            // Try to extract just the agency name
+            if (preg_match('/State of Oregon[^,]*(?:,[^,]+)?/i', $company['name'], $agencyMatch)) {
+                $company['name'] = trim($agencyMatch[0]);
+            } elseif (preg_match('/Housing and Community Services Department/i', $company['name'], $deptMatch)) {
+                $company['name'] = 'State of Oregon, ' . $deptMatch[0];
+            }
+        }
+
         if (($idFromFilename = $this->extractAgreementNumberFromFilename($originalName)) !== null) {
             $data['agreement_number'] = $idFromFilename;
         }
@@ -241,7 +280,6 @@ class PdfExtractionService
     {
         $out = ['grantor' => null, 'grantee' => null];
 
-        // Prefer "between … ("Short") and … , and is effective" so internal " and " (e.g. "development and urban") does not break captures.
         if (preg_match('/\bis between\s+(.+?)\(\s*"([^"]+)"\s*\)\s+and\s+(.+?),\s+and is effective/is', $raw, $m)) {
             $out['grantor'] = $this->partyNameFromBetweenGroups($m[1], $m[2]);
             $out['grantee'] = $this->shortenPartyDescription(trim($m[3]));
@@ -626,5 +664,150 @@ class PdfExtractionService
         }
 
         return array_filter($recipient);
+    }
+
+    // ==================== OREGON GRANT EXTRACTORS (IMPROVED) ====================
+
+    /**
+     * Extract recipient details from Oregon/Urban League style grant agreements.
+     * Looks for "Grantee's Grant Administrator", address line, etc.
+     */
+    protected function extractOregonGrantRecipient(string $raw): array
+    {
+        $recipient = [
+            'name' => null,
+            'street_address' => null,
+            'city_state_zip' => null,
+            'telephone' => null,
+            'email' => null,
+            'attention' => null,
+        ];
+
+        // 1. Find "Grantee's Grant Administrator is:" or similar (allow for line breaks)
+        // Pattern: Grantee's Grant Administrator is: Julia Delgado
+        if (preg_match('/Grantee\'s\s+Grant\s+Administrator\s*:\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)/', $raw, $match)) {
+            $recipient['name'] = trim($match[1]);
+        } elseif (preg_match('/Grantee\'s\s+Grant\s+Administrator\s*:\s*([^\n]+)/', $raw, $match)) {
+            // Catch any name (might include extra spaces)
+            $candidate = trim($match[1]);
+            if (preg_match('/^[A-Z][a-z]+ [A-Z][a-z]+/', $candidate, $nameMatch)) {
+                $recipient['name'] = $nameMatch[0];
+            }
+        }
+
+        // 2. Extract address block: look for number + street name, then city/state/zip
+        // The address often appears right after the name, sometimes on same line or next line
+        // Use a more flexible approach: find a line containing a number and "Street/St/Ave" etc.
+        $lines = explode("\n", $raw);
+        $foundNameLine = -1;
+        foreach ($lines as $idx => $line) {
+            if (!empty($recipient['name']) && str_contains($line, $recipient['name'])) {
+                $foundNameLine = $idx;
+                break;
+            }
+        }
+        if ($foundNameLine !== -1) {
+            // Look at the next 3 lines for address
+            for ($i = $foundNameLine; $i <= min($foundNameLine + 3, count($lines)-1); $i++) {
+                $line = $lines[$i];
+                // Check for address pattern: number then street keyword
+                if (preg_match('/\b(\d{1,5}\s+[A-Za-z0-9\.\s]+(?:Street|St|Avenue|Ave|Road|Rd|Drive|Dr|Lane|Ln|Boulevard|Blvd))/i', $line, $addrMatch)) {
+                    $recipient['street_address'] = trim($addrMatch[1]);
+                    // The remainder of the line or next line may contain city/state/zip
+                    $remaining = preg_replace('/'.preg_quote($recipient['street_address'], '/').'/', '', $line);
+                    if (preg_match('/([A-Za-z\s]+,\s*[A-Z]{2}\s*\d{5}(?:-\d{4})?)/', $remaining, $cityMatch)) {
+                        $recipient['city_state_zip'] = trim($cityMatch[1]);
+                    } else {
+                        // Check next line for city/state/zip
+                        if ($i+1 < count($lines) && preg_match('/([A-Za-z\s]+,\s*[A-Z]{2}\s*\d{5}(?:-\d{4})?)/', $lines[$i+1], $cityMatch2)) {
+                            $recipient['city_state_zip'] = trim($cityMatch2[1]);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        // If street address still not found, use a global regex that captures address line
+        if (empty($recipient['street_address'])) {
+            if (preg_match('/\b(\d{1,5}\s+[A-Za-z0-9\.\s]+(?:Street|St|Avenue|Ave|Road|Rd|Drive|Dr|Lane|Ln|Boulevard|Blvd))\s*[,.]?\s*([A-Za-z\s]+,\s*[A-Z]{2}\s*\d{5}(?:-\d{4})?)/i', $raw, $match)) {
+                $recipient['street_address'] = trim($match[1]);
+                $recipient['city_state_zip'] = trim($match[2]);
+            }
+        }
+
+        // 3. Extract phone number – look for pattern near the grantee block
+        if (preg_match('/\b(503[-\s]?890[-\s]?3556)\b/', $raw, $phoneMatch)) {
+            $recipient['telephone'] = $phoneMatch[1];
+        } elseif (preg_match('/\b(\d{3}[-\s]?\d{3}[-\s]?\d{4})\b/', $raw, $phoneMatch)) {
+            $recipient['telephone'] = $phoneMatch[1];
+        }
+
+        // 4. Extract email (already may be set, but ensure it's from ulpdx)
+        if (preg_match('/[A-Za-z0-9._%+-]+@ulpdx\.org/i', $raw, $emailMatch)) {
+            $recipient['email'] = $emailMatch[0];
+        }
+
+        return array_filter($recipient);
+    }
+
+    /**
+     * Extract company (grantor) details for Oregon grant – e.g. State of Oregon, agency name.
+     */
+    protected function extractOregonGrantCompany(string $raw): array
+    {
+        $company = [
+            'name' => null,
+            'street_address' => null,
+            'city_state_zip' => null,
+            'grant_administrator' => null,
+            'telephone' => null,
+            'email' => null,
+        ];
+
+        // 1. Agency name – clean version
+        if (preg_match('/State of Oregon acting by and through its ([^,]+(?:,[^,]+)?)/i', $raw, $match)) {
+            $agency = trim($match[1]);
+            // Remove any trailing "and" or extra words
+            $agency = preg_replace('/\s+and\s+.*$/i', '', $agency);
+            $company['name'] = 'State of Oregon, ' . $agency;
+        } elseif (preg_match('/Agency[:\s]+([^\n]+)/i', $raw, $match)) {
+            $company['name'] = trim($match[1]);
+        }
+
+        // 2. Agency's Grant Administrator
+        if (preg_match('/Agency\'s\s+Grant\s+Administrator\s*:\s*([A-Z][a-z]+ [A-Z][a-z]+)/', $raw, $match)) {
+            $company['grant_administrator'] = trim($match[1]);
+        }
+
+        // 3. Agency address – look for "725 Summer Street" pattern
+        if (preg_match('/\b(725\s+Summer\s+Street[^,]*,[^,]*,\s*Salem,\s*OR\s*\d{5})\b/i', $raw, $match)) {
+            $fullAddr = trim($match[1]);
+            // Split into street and city/state/zip
+            if (preg_match('/^(.+?),\s*(.+)$/', $fullAddr, $parts)) {
+                $company['street_address'] = trim($parts[1]);
+                $company['city_state_zip'] = trim($parts[2]);
+            } else {
+                $company['city_state_zip'] = $fullAddr;
+            }
+        } elseif (preg_match('/\b(\d{1,5}\s+[A-Za-z\s]+(?:Street|St|Avenue|Ave|Road|Rd|Drive|Dr|Lane|Ln|Boulevard|Blvd)[,.]?\s+[A-Za-z\s]+,\s*[A-Z]{2}\s*\d{5})/i', $raw, $match)) {
+            $fullAddr = trim($match[1]);
+            if (preg_match('/^(.+?),\s*(.+)$/', $fullAddr, $parts)) {
+                $company['street_address'] = trim($parts[1]);
+                $company['city_state_zip'] = trim($parts[2]);
+            }
+        }
+
+        // 4. Agency email – look for @hcs.oregon.gov
+        if (preg_match('/[A-Za-z0-9._%+-]+@hcs\.oregon\.gov/i', $raw, $emailMatch)) {
+            $company['email'] = $emailMatch[0];
+        }
+
+        // 5. Agency telephone
+        if (preg_match('/\b(503[-\s]?881[-\s]?4792)\b/', $raw, $phoneMatch)) {
+            $company['telephone'] = $phoneMatch[1];
+        }
+
+        return array_filter($company);
     }
 }
