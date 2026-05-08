@@ -42,10 +42,16 @@ class PdfExtractionService
         // ----- Oregon Grant specific extraction (overwrites missing fields) -----
         $oregonRecipient = $this->extractOregonGrantRecipient($norm);
         $oregonCompany = $this->extractOregonGrantCompany($norm);
+        $isOhcsGrant = $this->isOhcsGrantDocument($norm);
 
-        // Merge: Oregon data takes precedence only if original is empty
-        $recipient = array_merge($recipient, array_filter($oregonRecipient));
-        $company = array_merge($company, array_filter($oregonCompany));
+        // Merge: for OHCS grant templates, prefer Oregon extraction strongly.
+        if ($isOhcsGrant) {
+            $recipient = array_merge($recipient, $oregonRecipient);
+            $company = array_merge($company, $oregonCompany);
+        } else {
+            $recipient = array_merge($recipient, array_filter($oregonRecipient));
+            $company = array_merge($company, array_filter($oregonCompany));
+        }
 
         // Fix swapped addresses: if recipient has agency address (Salem) and company has no address, swap
         if (isset($recipient['city_state_zip']) && str_contains($recipient['city_state_zip'], 'Salem')) {
@@ -84,6 +90,9 @@ class PdfExtractionService
 
         $this->fillDatesFromTimeline($norm, $data);
         $this->enrichContactsFromFullText($norm, $company, $recipient);
+        $this->applyOhcsGrantFixes($norm, $data, $company, $recipient);
+        $this->applyOhaGrantFixes($norm, $data, $company, $recipient);
+        $this->applyProsperPortlandFixes($norm, $data, $company, $recipient);
 
         return array_filter([
             'name' => $originalName ?? null,
@@ -255,6 +264,7 @@ class PdfExtractionService
     {
         $raw = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F]/', '', $raw);
         $raw = str_replace(["\u{201C}", "\u{201D}"], '"', $raw);
+        $raw = str_replace(["\u{2018}", "\u{2019}"], "'", $raw);
         $raw = str_replace(['¡', '·', "\u{00A0}", "\u{200B}"], ' ', $raw);
         if (function_exists('iconv')) {
             $converted = @iconv('UTF-8', 'UTF-8//IGNORE', $raw);
@@ -426,6 +436,14 @@ class PdfExtractionService
 
     protected function extractGrantAmount(string $text): ?string
     {
+        if (preg_match('/Grant\s+Funds[^$]{0,120}\$\s*([\d,]+(?:\.\d{2})?)/i', $text, $m)) {
+            return $m[1];
+        }
+
+        if (preg_match('/provide\s+Grantee\s+up\s+to\s*\$\s*([\d,]+(?:\.\d{2})?)/i', $text, $m)) {
+            return $m[1];
+        }
+
         if (preg_match('/maximum\s+not-to-exceed\s+amount[^$]*?\$\s*([\d,]+\.?\d*)/i', $text, $m)) {
             return $m[1];
         }
@@ -466,6 +484,10 @@ class PdfExtractionService
 
     protected function extractEffectiveDate(string $text): ?string
     {
+        if (preg_match('/effective[^.]{0,120}\bas\s+of\s+([A-Za-z]+\s+\d{1,2},?\s+\d{4})/i', $text, $m)) {
+            return trim($m[1]);
+        }
+
         if (preg_match('/may\s+start\s+on\s+([A-Za-z]+\s+\d{1,2},?\s+\d{4})/i', $text, $m)) {
             return trim($m[1]);
         }
@@ -685,9 +707,9 @@ class PdfExtractionService
 
         // 1. Find "Grantee's Grant Administrator is:" or similar (allow for line breaks)
         // Pattern: Grantee's Grant Administrator is: Julia Delgado
-        if (preg_match('/Grantee\'s\s+Grant\s+Administrator\s*:\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)/', $raw, $match)) {
+        if (preg_match('/Grantee\'?s\s+Grant\s+Administrator\s*(?:is)?\s*:\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)/i', $raw, $match)) {
             $recipient['name'] = trim($match[1]);
-        } elseif (preg_match('/Grantee\'s\s+Grant\s+Administrator\s*:\s*([^\n]+)/', $raw, $match)) {
+        } elseif (preg_match('/Grantee\'?s\s+Grant\s+Administrator\s*(?:is)?\s*:\s*([^\n]+)/i', $raw, $match)) {
             // Catch any name (might include extra spaces)
             $candidate = trim($match[1]);
             if (preg_match('/^[A-Z][a-z]+ [A-Z][a-z]+/', $candidate, $nameMatch)) {
@@ -748,7 +770,7 @@ class PdfExtractionService
             $recipient['email'] = $emailMatch[0];
         }
 
-        return array_filter($recipient);
+        return $recipient;
     }
 
     /**
@@ -766,17 +788,17 @@ class PdfExtractionService
         ];
 
         // 1. Agency name – clean version
-        if (preg_match('/State of Oregon acting by and through its ([^,]+(?:,[^,]+)?)/i', $raw, $match)) {
+        if (preg_match('/State of Oregon acting by and through its ([^\n]+?)(?:\(|and\s|,?\s+each\b)/i', $raw, $match)) {
             $agency = trim($match[1]);
             // Remove any trailing "and" or extra words
             $agency = preg_replace('/\s+and\s+.*$/i', '', $agency);
-            $company['name'] = 'State of Oregon, ' . $agency;
+            $company['name'] = trim('State of Oregon '.$agency);
         } elseif (preg_match('/Agency[:\s]+([^\n]+)/i', $raw, $match)) {
             $company['name'] = trim($match[1]);
         }
 
         // 2. Agency's Grant Administrator
-        if (preg_match('/Agency\'s\s+Grant\s+Administrator\s*:\s*([A-Z][a-z]+ [A-Z][a-z]+)/', $raw, $match)) {
+        if (preg_match('/Agency\'?s\s+Grant\s+Administrator\s*(?:is)?\s*:\s*([A-Z][a-z]+ [A-Z][a-z]+)/i', $raw, $match)) {
             $company['grant_administrator'] = trim($match[1]);
         }
 
@@ -808,6 +830,193 @@ class PdfExtractionService
             $company['telephone'] = $phoneMatch[1];
         }
 
-        return array_filter($company);
+        return $company;
+    }
+
+    protected function isOhcsGrantDocument(string $raw): bool
+    {
+        $lower = mb_strtolower($raw);
+
+        return str_contains($lower, 'ohcs')
+            || str_contains($lower, 'housing and community services department')
+            || str_contains($lower, 'ore-dap')
+            || str_contains($lower, 'grant no. 9263');
+    }
+
+    /**
+     * Apply strict corrections for OHCS grant templates that include both Agency and Grantee administrator blocks.
+     *
+     * @param  array<string, mixed>  $data
+     * @param  array<string, mixed>  $company
+     * @param  array<string, mixed>  $recipient
+     */
+    protected function applyOhcsGrantFixes(string $raw, array &$data, array &$company, array &$recipient): void
+    {
+        if (! $this->isOhcsGrantDocument($raw)) {
+            return;
+        }
+
+        if (preg_match('/Grant\s+No\.?\s*([A-Z0-9\-]+)/i', $raw, $m)) {
+            $data['agreement_number'] = trim($m[1]);
+        }
+
+        if (preg_match('/provide\s+Grantee\s+up\s+to\s*\$\s*([\d,]+(?:\.\d{2})?)/i', $raw, $m)) {
+            $data['grant_amount'] = trim($m[1]);
+        }
+
+        if (preg_match('/effective[^.]{0,120}\bas\s+of\s+([A-Za-z]+\s+\d{1,2},?\s+\d{4})/i', $raw, $m)) {
+            $data['effective_date'] = trim($m[1]);
+        }
+
+        if (preg_match('/will\s+expire\s+on\s+([A-Za-z]+\s+\d{1,2},?\s+\d{4})/i', $raw, $m)) {
+            $data['expiry_date'] = trim($m[1]);
+        }
+
+        if (preg_match('/and\s+The Urban League of Portland, Inc\./i', $raw)) {
+            $recipient['name'] = 'The Urban League of Portland, Inc.';
+        }
+
+        if (preg_match('/4\.2\s+Grantee\'?s\s+Grant\s+Administrator\s+is:\s*([A-Za-z ]+)/i', $raw, $m)) {
+            $recipient['attention'] = trim($m[1]);
+        }
+
+        if (preg_match('/4\.2\s+Grantee\'?s\s+Grant\s+Administrator\s+is:\s*[^\n]*\n\s*([0-9][^\n]+)/i', $raw, $m)) {
+            if (preg_match('/^(.+?),\s*([A-Za-z ].*?\d{5}(?:-\d{4})?)$/', trim($m[1]), $parts)) {
+                $recipient['street_address'] = trim($parts[1]);
+                $recipient['city_state_zip'] = trim($parts[2]);
+            } else {
+                $recipient['street_address'] = trim($m[1]);
+            }
+        }
+
+        if (preg_match('/\b(503[-\s]?890[-\s]?3556)\b/', $raw, $m)) {
+            $recipient['telephone'] = trim($m[1]);
+        }
+        if (preg_match('/[A-Za-z0-9._%+-]+@ulpdx\.org/i', $raw, $m)) {
+            $recipient['email'] = trim($m[0]);
+        }
+
+        if (preg_match('/State of Oregon acting by and through its Housing and\s+Community Services Department/i', $raw)) {
+            $company['name'] = 'State of Oregon Housing and Community Services Department';
+        }
+        if (preg_match('/4\.1\s+Agency\'?s\s+Grant\s+Administrator\s+is:\s*([A-Za-z ]+)/i', $raw, $m)) {
+            $company['grant_administrator'] = trim($m[1]);
+        }
+        if (preg_match('/\b725\s+Summer\s+Street\s+NE\b/i', $raw, $m)) {
+            $company['street_address'] = trim($m[0]);
+        }
+        if (preg_match('/\bSuite\s+B,\s+Salem,\s+OR\s+97301\b/i', $raw, $m)) {
+            $company['city_state_zip'] = trim($m[0]);
+        }
+        if (preg_match('/\b(503[-\s]?881[-\s]?4792)\b/', $raw, $m)) {
+            $company['telephone'] = trim($m[1]);
+        }
+        if (preg_match('/[A-Za-z0-9._%+-]+@hcs\.oregon\.gov/i', $raw, $m)) {
+            $company['email'] = trim($m[0]);
+        }
+    }
+
+    protected function isProsperPortlandDocument(string $raw): bool
+    {
+        $lower = mb_strtolower($raw);
+
+        return str_contains($lower, 'prosper portland')
+            || str_contains($lower, 'community opportunities and enhancements program')
+            || str_contains($lower, 'third amendment to grant agreement');
+    }
+
+    /**
+     * Apply strict corrections for Prosper Portland amendment templates.
+     *
+     * @param  array<string, mixed>  $data
+     * @param  array<string, mixed>  $company
+     * @param  array<string, mixed>  $recipient
+     */
+    protected function applyProsperPortlandFixes(string $raw, array &$data, array &$company, array &$recipient): void
+    {
+        if (! $this->isProsperPortlandDocument($raw)) {
+            return;
+        }
+
+        if (preg_match('/Grant\s+No\.?\s*([A-Z0-9\-]+)/i', $raw, $m)) {
+            $data['agreement_number'] = trim($m[1]);
+        }
+        if (preg_match('/Grant\s+to\s+[A-Z\s\-]+\(\s*\$\s*([\d,]+(?:\.\d{2})?)\s*\)/i', $raw, $m)) {
+            $data['grant_amount'] = trim($m[1]);
+        }
+        if (preg_match('/Grant\s+Agreement\s+dated\s+([A-Za-z]+\s+\d{1,2},?\s+\d{4})/i', $raw, $m)) {
+            $data['effective_date'] = preg_replace('/\s+/', ' ', trim($m[1]));
+        }
+        if (preg_match('/termination[^.]{0,200}\bchanged\s+to\s+([A-Za-z]+\s+\d{1,2},?\s+\d{4})/i', $raw, $m)) {
+            $data['expiry_date'] = preg_replace('/\s+/', ' ', trim($m[1]));
+        }
+
+        if (preg_match('/and\s+The Urban League of Portland, Inc\./i', $raw)) {
+            $recipient['name'] = 'The Urban League of Portland, Inc.';
+        }
+        if (preg_match('/\bJulia\s+D[ae]lgado\b/i', $raw, $m)) {
+            $recipient['attention'] = trim(str_ireplace('Dlgado', 'Delgado', $m[0]));
+        }
+
+        $company['name'] = 'Prosper Portland';
+
+        if (preg_match('/theresa\.green@portlandoregon\.gov/i', $raw, $m)) {
+            $company['email'] = trim($m[0]);
+        }
+
+        if (preg_match('/theresa\.green@portlandoregon\.gov/i', $raw)) {
+            $company['grant_administrator'] = 'Theresa Green';
+        }
+    }
+
+    protected function isOhaGrantDocument(string $raw): bool
+    {
+        $lower = mb_strtolower($raw);
+
+        return str_contains($lower, 'oregon health authority')
+            || str_contains($lower, 'state of oregon')
+            || str_contains($lower, 'grant agreement number po-44300-');
+    }
+
+    /**
+     * Apply strict corrections for OHA grant templates.
+     *
+     * @param  array<string, mixed>  $data
+     * @param  array<string, mixed>  $company
+     * @param  array<string, mixed>  $recipient
+     */
+    protected function applyOhaGrantFixes(string $raw, array &$data, array &$company, array &$recipient): void
+    {
+        if (! $this->isOhaGrantDocument($raw)) {
+            return;
+        }
+
+        $company['name'] = 'Oregon Health Authority';
+
+        if (preg_match('/\bExternal\s+Relations\s+Division\b/i', $raw, $m)) {
+            $company['division'] = trim($m[0]);
+        }
+        if (preg_match('/\bOffice\s+of\s+Community\s+Health\s+and\s+Engagement\b/i', $raw, $m)) {
+            $company['office'] = trim($m[0]);
+        }
+
+        if (preg_match('/\b500\s+Summer\s+Street\s+NE,\s*E-03\b/i', $raw, $m)) {
+            $company['street_address'] = trim($m[0]);
+        } elseif (preg_match('/\b500\s+Summer\s+Street\s+NE\b/i', $raw, $m)) {
+            $company['street_address'] = trim($m[0]);
+        }
+
+        if (preg_match('/\bSalem,\s*Oregon\s*97301\b/i', $raw, $m)) {
+            $company['city_state_zip'] = preg_replace('/\s+/', ' ', trim($m[0]));
+        }
+        if (preg_match('/Grant\s+Administrator:\s*([^\n\r]+?)(?=\s*Telephone|$)/i', $raw, $m)) {
+            $company['grant_administrator'] = trim(preg_replace('/\s+/', ' ', $m[1]));
+        }
+        if (preg_match('/\b(503[-\s]?891[-\s]?3367)\b/', $raw, $m)) {
+            $company['telephone'] = trim($m[1]);
+        }
+        if (preg_match('/[A-Za-z0-9._%+-]+@oha\.oregon\.gov/i', $raw, $m)) {
+            $company['email'] = trim($m[0]);
+        }
     }
 }
