@@ -56,18 +56,18 @@ class PdfExtractionService
         // Fix swapped addresses: if recipient has agency address (Salem) and company has no address, swap
         if (isset($recipient['city_state_zip']) && str_contains($recipient['city_state_zip'], 'Salem')) {
             // Likely swapped: move agency address to company, grantee address to recipient
-            if (empty($company['city_state_zip']) && !empty($recipient['city_state_zip'])) {
+            if (empty($company['city_state_zip']) && ! empty($recipient['city_state_zip'])) {
                 $company['city_state_zip'] = $recipient['city_state_zip'];
                 $recipient['city_state_zip'] = null;
             }
-            if (empty($company['street_address']) && !empty($recipient['street_address']) && str_contains($recipient['street_address'], 'Summer')) {
+            if (empty($company['street_address']) && ! empty($recipient['street_address']) && str_contains($recipient['street_address'], 'Summer')) {
                 $company['street_address'] = $recipient['street_address'];
                 $recipient['street_address'] = null;
             }
         }
 
         // Special fix: if recipient name is still empty but we have an email with ulpdx.org, try to extract name from nearby text
-        if (empty($recipient['name']) && !empty($recipient['email']) && str_contains($recipient['email'], 'ulpdx')) {
+        if (empty($recipient['name']) && ! empty($recipient['email']) && str_contains($recipient['email'], 'ulpdx')) {
             // Find the line containing the email and capture a name before it
             if (preg_match('/([A-Z][a-z]+ [A-Z][a-z]+).*?'.preg_quote($recipient['email'], '/').'/s', $norm, $nameMatch)) {
                 $recipient['name'] = trim($nameMatch[1]);
@@ -75,12 +75,12 @@ class PdfExtractionService
         }
 
         // If company name is too long or contains "Grantee", clean it up
-        if (!empty($company['name']) && (strlen($company['name']) > 100 || stripos($company['name'], 'Grantee') !== false)) {
+        if (! empty($company['name']) && (strlen($company['name']) > 100 || stripos($company['name'], 'Grantee') !== false)) {
             // Try to extract just the agency name
             if (preg_match('/State of Oregon[^,]*(?:,[^,]+)?/i', $company['name'], $agencyMatch)) {
                 $company['name'] = trim($agencyMatch[0]);
             } elseif (preg_match('/Housing and Community Services Department/i', $company['name'], $deptMatch)) {
-                $company['name'] = 'State of Oregon, ' . $deptMatch[0];
+                $company['name'] = 'State of Oregon, '.$deptMatch[0];
             }
         }
 
@@ -93,6 +93,7 @@ class PdfExtractionService
         $this->applyOhcsGrantFixes($norm, $data, $company, $recipient);
         $this->applyOhaGrantFixes($norm, $data, $company, $recipient);
         $this->applyProsperPortlandFixes($norm, $data, $company, $recipient);
+        $this->applyMultnomahCountyContractPoFixes($norm, $data, $company, $recipient);
 
         return array_filter([
             'name' => $originalName ?? null,
@@ -124,6 +125,10 @@ class PdfExtractionService
      */
     protected function extractAgreementNumberFromFilename(string $originalName): ?string
     {
+        if (preg_match('/\b(POID\.\d+)\b/i', $originalName, $m)) {
+            return $m[1];
+        }
+
         if (preg_match('/\b(\d{2}[Rr][Hh]\d{4,})\b/', $originalName, $m)) {
             return strtoupper($m[1]);
         }
@@ -723,14 +728,14 @@ class PdfExtractionService
         $lines = explode("\n", $raw);
         $foundNameLine = -1;
         foreach ($lines as $idx => $line) {
-            if (!empty($recipient['name']) && str_contains($line, $recipient['name'])) {
+            if (! empty($recipient['name']) && str_contains($line, $recipient['name'])) {
                 $foundNameLine = $idx;
                 break;
             }
         }
         if ($foundNameLine !== -1) {
             // Look at the next 3 lines for address
-            for ($i = $foundNameLine; $i <= min($foundNameLine + 3, count($lines)-1); $i++) {
+            for ($i = $foundNameLine; $i <= min($foundNameLine + 3, count($lines) - 1); $i++) {
                 $line = $lines[$i];
                 // Check for address pattern: number then street keyword
                 if (preg_match('/\b(\d{1,5}\s+[A-Za-z0-9\.\s]+(?:Street|St|Avenue|Ave|Road|Rd|Drive|Dr|Lane|Ln|Boulevard|Blvd))/i', $line, $addrMatch)) {
@@ -741,7 +746,7 @@ class PdfExtractionService
                         $recipient['city_state_zip'] = trim($cityMatch[1]);
                     } else {
                         // Check next line for city/state/zip
-                        if ($i+1 < count($lines) && preg_match('/([A-Za-z\s]+,\s*[A-Z]{2}\s*\d{5}(?:-\d{4})?)/', $lines[$i+1], $cityMatch2)) {
+                        if ($i + 1 < count($lines) && preg_match('/([A-Za-z\s]+,\s*[A-Z]{2}\s*\d{5}(?:-\d{4})?)/', $lines[$i + 1], $cityMatch2)) {
                             $recipient['city_state_zip'] = trim($cityMatch2[1]);
                         }
                     }
@@ -1017,6 +1022,86 @@ class PdfExtractionService
         }
         if (preg_match('/[A-Za-z0-9._%+-]+@oha\.oregon\.gov/i', $raw, $m)) {
             $company['email'] = trim($m[0]);
+        }
+    }
+
+    protected function isMultnomahCountyContractPo(string $raw): bool
+    {
+        $lower = mb_strtolower($raw);
+
+        if (! str_contains($lower, 'multnomah county')) {
+            return false;
+        }
+
+        return str_contains($lower, 'contract purchase order')
+            || str_contains($lower, 'change order poid.');
+    }
+
+    /**
+     * Multnomah County Contract Purchase Order: supplier = grantee, ship-to = county / program contact.
+     *
+     * @param  array<string, mixed>  $data
+     * @param  array<string, mixed>  $company
+     * @param  array<string, mixed>  $recipient
+     */
+    protected function applyMultnomahCountyContractPoFixes(string $raw, array &$data, array &$company, array &$recipient): void
+    {
+        if (! $this->isMultnomahCountyContractPo($raw)) {
+            return;
+        }
+
+        if (preg_match('/Change Order\s+(POID\.\d+)/i', $raw, $m)) {
+            $data['agreement_number'] = $m[1];
+        }
+
+        if (preg_match('/Supplier Address\s*\R\s*([^\r\n]+?)\s*\R\s*([^\r\n]+?)\s*\R\s*([^\r\n]+)/i', $raw, $m)) {
+            $recipient['name'] = trim(preg_replace('/\s+/', ' ', $m[1]));
+            $recipient['street_address'] = trim(preg_replace('/\s+/', ' ', $m[2]));
+            $recipient['city_state_zip'] = trim(preg_replace('/\s+/', ' ', $m[3]));
+        }
+
+        if (preg_match('/Ship To:\s*\R\s*([^\r\n]+?)\s*\R\s*([^\r\n]+?)\s*\R\s*([^\r\n]+)/i', $raw, $m)) {
+            $company['grant_administrator'] = trim(preg_replace('/\s+/', ' ', $m[1]));
+            $company['street_address'] = trim(preg_replace('/\s+/', ' ', $m[2]));
+            $company['city_state_zip'] = trim(preg_replace('/\s+/', ' ', $m[3]));
+        }
+
+        $company['name'] = 'Multnomah County Oregon';
+
+        if (preg_match('/Buyer\/Phone\s*([^\r\n]+)\s*\R\s*([^\r\n]+)/i', $raw, $m)) {
+            $division = trim(preg_replace('/\s+/', ' ', $m[1].' '.$m[2]));
+            if ($division !== '') {
+                $company['division'] = $division;
+            }
+        }
+
+        if (preg_match('/\(\s*503\s*\)\s*988\s*8239\b/i', $raw) || preg_match('/\b503[\s\-]*988[\s\-]*8239\b/', $raw)) {
+            $company['telephone'] = '503-988-8239';
+        }
+
+        if (preg_match('/[A-Za-z0-9._%+-]+@multco\.us\b/i', $raw, $m)) {
+            $company['email'] = strtolower(trim($m[0]));
+            $recipient['email'] = null;
+        }
+
+        if (preg_match('/Validity Dates:\s*([A-Za-z]+\s+\d{1,2},\s*\d{4})\s*[-–]\s*([A-Za-z]+\s+\d{1,2},\s*\d{4})/i', $raw, $m)) {
+            $data['effective_date'] = trim($m[1]);
+            $data['expiry_date'] = trim($m[2]);
+        } else {
+            if (empty($data['effective_date']) && preg_match('/\bDate\s+(\d{1,2}\/\d{1,2}\/\d{4})\b/', $raw, $m)) {
+                $data['effective_date'] = trim($m[1]);
+            }
+            if (empty($data['expiry_date']) && preg_match('/Due Date\s+(\d{1,2}\/\d{1,2}\/\d{4})\b/i', $raw, $m)) {
+                $data['expiry_date'] = trim($m[1]);
+            }
+        }
+
+        if (preg_match('/Change Order\s+POID\.[^\r\n]+\s*\R\s*Date\s+(\d{1,2}\/\d{1,2}\/\d{4})/i', $raw, $m)) {
+            $data['template_date'] = trim($m[1]);
+        }
+
+        if (preg_match('/Total\s*\$\s*([\d,]+(?:\.\d{2})?)/i', $raw, $m)) {
+            $data['grant_amount'] = trim($m[1]);
         }
     }
 }
