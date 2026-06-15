@@ -220,7 +220,8 @@ class ContractController extends Controller
             });
         }
 
-        $contracts = $query->orderBy('expiry_date','asc')
+        $contracts = $query->orderByRaw('expiry_date IS NULL')
+            ->orderBy('expiry_date', 'asc')
             ->paginate((int) $request->input('per_page', 15))
             ->withQueryString();
 
