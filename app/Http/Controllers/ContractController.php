@@ -188,6 +188,45 @@ class ContractController extends Controller
         return response()->json($contracts);
     }
 
+    public function dueContractList(Request $request): JsonResponse
+    {
+        $request->validate([
+            'status' => ['nullable', 'in:in_progress,completed'],
+            'search' => ['nullable', 'string', 'max:255'],
+            'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
+        ]);
+
+        $mycontracts = $request->user()->contracts()->where('status', Contract::STATUS_IN_PROGRESS)->get();
+
+        foreach ($mycontracts as $contract) {
+            $contract->refreshStatusFromExpiry();
+        }
+
+        $query = $request->user()
+            ->contracts()
+            ->with('documents');
+
+        if ($status = $request->input('status')) {
+            $query->where('status', $status);
+        }
+
+        if ($search = trim((string) $request->input('search'))) {
+            $like = '%'.$search.'%';
+            $query->where(function ($q) use ($like) {
+                $q->where('name', 'like', $like)
+                    ->orWhere('agreement_number', 'like', $like)
+                    ->orWhere('recipient_name', 'like', $like)
+                    ->orWhere('company_name', 'like', $like);
+            });
+        }
+
+        $contracts = $query->orderBy('expiry_date','asc')
+            ->paginate((int) $request->input('per_page', 15))
+            ->withQueryString();
+
+        return response()->json($contracts);
+    }
+
     public function show(Request $request, Contract $contract): JsonResponse
     {
         if ($contract->user_id !== $request->user()->id) {

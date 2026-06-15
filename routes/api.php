@@ -33,5 +33,6 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('contracts', [\App\Http\Controllers\ContractController::class, 'create']);
     Route::post('contracts/{contract}/update', [\App\Http\Controllers\ContractController::class, 'update']);
     Route::get('contracts', [\App\Http\Controllers\ContractController::class, 'index']);
+    Route::get('contracts/due-contract-list', [\App\Http\Controllers\ContractController::class, 'dueContractList']);
     Route::get('contracts/{contract}', [\App\Http\Controllers\ContractController::class, 'show']);
 });
